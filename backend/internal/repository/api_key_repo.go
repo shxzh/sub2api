@@ -43,7 +43,50 @@ func (r *apiKeyRepository) activeQuery() *dbent.APIKeyQuery {
 }
 
 func (r *apiKeyRepository) Create(ctx context.Context, key *service.APIKey) error {
-	builder := r.client.APIKey.Create().
+	if key.DelegatedOperation == "" {
+		return insertAPIKey(ctx, r.client, key)
+	}
+	tx, err := r.client.Tx(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	client := tx.Client()
+	// The reservation, generated key and receipt commit together. INSERT waits for a concurrent issuer.
+	res, err := client.ExecContext(ctx, "INSERT INTO delegated_key_receipts(operation) VALUES ($1) ON CONFLICT DO NOTHING", key.DelegatedOperation)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		rows, err := client.QueryContext(ctx, "SELECT key_id FROM delegated_key_receipts WHERE operation=$1", key.DelegatedOperation)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		if !rows.Next() {
+			return fmt.Errorf("missing delegated key receipt")
+		}
+		if err := rows.Scan(&key.ID); err != nil {
+			return err
+		}
+		key.Key = ""
+		return nil
+	}
+	if err := insertAPIKey(ctx, client, key); err != nil {
+		return err
+	}
+	if _, err := client.ExecContext(ctx, "UPDATE delegated_key_receipts SET key_id=$1 WHERE operation=$2", key.ID, key.DelegatedOperation); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func insertAPIKey(ctx context.Context, client *dbent.Client, key *service.APIKey) error {
+	builder := client.APIKey.Create().
 		SetUserID(key.UserID).
 		SetKey(key.Key).
 		SetName(key.Name).
